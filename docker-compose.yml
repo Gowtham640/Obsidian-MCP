@@ -4,7 +4,9 @@ services:
     container_name: mcp-oauth-gateway
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      # HOST_PORT lets you pick a free host port when 3000 is taken
+      # (container port stays 3000; the funnel/tunnel should target $HOST_PORT).
+      - "${HOST_PORT:-3000}:3000"
     environment:
       PORT: "3000"
       # The public https:// URL that fronts this gateway (must match the external
