@@ -1,0 +1,36 @@
+services:
+  mcp-oauth-gateway:
+    build: .
+    container_name: mcp-oauth-gateway
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      # The public https:// URL that fronts this gateway (must match the external
+      # URL character-for-character, e.g. https://host.example.com or
+      # https://anassyed-homelab.tail3bc01f.ts.net:8443).
+      PUBLIC_URL: ${PUBLIC_URL:?Set PUBLIC_URL in .env}
+      # Password typed into the /authorize login page.
+      MASTER_PASSWORD: ${MASTER_PASSWORD:?Set MASTER_PASSWORD in .env}
+      # HS256 secret for JWT access tokens. Generate: openssl rand -base64 48
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      # Unauthenticated MCP upstream this gateway protects.
+      # Default reaches the obsidian-mcp container's published host port (8385)
+      # via host.docker.internal — works on both Linux hosts (extra_hosts below)
+      # and Docker Desktop (Mac/Windows).
+      MCP_UPSTREAM_URL: ${MCP_UPSTREAM_URL:-http://host.docker.internal:8385}
+      ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS:-43200}
+      AUTH_CODE_TTL_SECONDS: ${AUTH_CODE_TTL_SECONDS:-60}
+    extra_hosts:
+      # Required on Linux hosts (e.g. the homelab) so host.docker.internal
+      # resolves to the host and reaches the 8385 published port.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Persist registered OAuth clients (Claude's DCR registration) across restarts.
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

@@ -1,0 +1,23 @@
+{
+  "name": "mcp-oauth-gateway",
+  "version": "1.0.0",
+  "description": "OAuth 2.1 authorization server + authenticated reverse proxy in front of an unauthenticated SSE MCP server (built for Claude.ai custom connectors: PKCE S256 + Dynamic Client Registration + JWT bearer).",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "smoke": "node scripts/smoke.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "http-proxy": "^1.18.1",
+    "jose": "^5.9.6"
+  },
+  "license": "MIT"
+}
