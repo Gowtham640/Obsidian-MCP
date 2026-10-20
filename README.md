@@ -71,25 +71,23 @@ tunnel in front of port `3000` instead of `8385` (see below).
    `MASTER_PASSWORD` → Claude exchanges the code with PKCE at `/token`.
 4. Every MCP request through `/sse` / `/message` now carries a signed Bearer JWT.
 
-## Putting the public tunnel in front (homelab)
+## Putting the public tunnel in front (homelab — actual deployment)
 
-The homelab already has a Tailscale Funnel and a Cloudflare quick-tunnel container
-for the raw MCP (see vault note `Progress/Obsidian-MCP-Public-Tunnel-2026-10-20`).
-Point them at the gateway instead of the unauthenticated MCP:
+The homelab's host port 3000 is taken, so the gateway publishes on **3385**
+(`HOST_PORT=3385` in `.env`; deployed at `~/stacks/mcp-oauth-gateway`). The
+Tailscale Funnel fronts it publicly:
 
 ```bash
-# Tailscale Funnel -> gateway :3000
-ssh homelab "tailscale funnel --bg --https=8443 http://127.0.0.1:3000"
+# Funnel -> gateway :3385 (public https://anassyed-homelab.tail3bc01f.ts.net:8443)
+ssh homelab "tailscale funnel --bg --https=8443 http://127.0.0.1:3385"
 
-# Cloudflare quick tunnel -> funnel (URL rotates on restart)
-ssh homelab "docker rm -f obsidian-cf-tunnel; docker run -d --name obsidian-cf-tunnel --dns 1.1.1.1 --dns 8.8.8.8 cloudflare/cloudflared:latest tunnel --url https://anassyed-homelab.tail3bc01f.ts.net:8443"
+# stop exposing the gateway publicly
+ssh homelab "tailscale funnel --https=8443 off"
 ```
 
-Then set `PUBLIC_URL` in `.env` to the exact external URL (including `:8443` if used)
-and `docker compose up -d` again. Because quick-tunnel URLs rotate, prefer the stable
-Funnel URL (or a named Cloudflare tunnel on a domain you own) for `PUBLIC_URL` —
-changing the issuer invalidates previously issued tokens and requires re-connecting
-the connector in Claude.
+`PUBLIC_URL` in `.env` must equal the external URL exactly (including the
+`:8443`). Changing the issuer invalidates previously issued tokens and
+requires re-connecting the connector in Claude.
 
 **Security note:** until the tunnel points at the gateway, the raw MCP on `:8385`
 remains exposed unauthenticated. After switching, nothing sensitive is reachable
