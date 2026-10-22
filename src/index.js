@@ -17,7 +17,7 @@
  *   GET  /authorize                                  login page (MASTER_PASSWORD)
  *   POST /authorize                                  → 302 with single-use code
  *   POST /token                                      PKCE S256 exchange → JWT
- *   ALL  /mcp, /sse, /message, /messages             authenticated streaming proxy
+ *   ALL  /sse, /message, /messages                   authenticated streaming proxy
  *
  * Env (see .env.example): PORT, PUBLIC_URL, MASTER_PASSWORD, STATIC_API_KEY,
  * JWT_SECRET, OBSIDIAN_MCP_URL, ACCESS_TOKEN_TTL_SECONDS, AUTH_CODE_TTL_SECONDS,
@@ -51,12 +51,11 @@ const config = {
   masterPassword: required('MASTER_PASSWORD'),
   staticApiKey: required('STATIC_API_KEY'),
   jwtSecret: required('JWT_SECRET'),
-  // Accepts the URL with or without the trailing /mcp or /sse path.
-  upstreamBase: (process.env.OBSIDIAN_MCP_URL || 'http://host.docker.internal:8385/mcp')
+  // Accepts the URL with or without the trailing /sse path.
+  upstreamBase: (process.env.OBSIDIAN_MCP_URL || 'http://host.docker.internal:8385/sse')
     .replace(/\/+$/, '')
-    .replace(/\/(mcp|sse)$/, ''),
-  // /mcp = Streamable HTTP; /sse + /message(s) = legacy SSE transport.
-  proxyPaths: (process.env.PROXY_PATHS || '/mcp,/sse,/message,/messages').split(',').map((s) => s.trim()).filter(Boolean),
+    .replace(/\/sse$/, ''),
+  proxyPaths: (process.env.PROXY_PATHS || '/sse,/message,/messages').split(',').map((s) => s.trim()).filter(Boolean),
   accessTokenTtl: Number(process.env.ACCESS_TOKEN_TTL_SECONDS || 12 * 60 * 60),
   authCodeTtl: Number(process.env.AUTH_CODE_TTL_SECONDS || 60),
   dataDir: process.env.DATA_DIR || path.join(process.cwd(), 'data'),
@@ -178,7 +177,7 @@ const app = express();
 app.disable('x-powered-by');
 
 app.get('/healthz', (req, res) => {
-  res.json({ ok: true, issuer: config.publicUrl, upstream: config.upstreamBase });
+  res.json({ ok: true, issuer: config.publicUrl, upstream: `${config.upstreamBase}/sse` });
 });
 
 /* -------- OAuth 2.1: discovery, dynamic client registration, token ------- */

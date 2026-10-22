@@ -3,3 +3,7 @@ data/
 .env
 .DS_Store
 *.log
+
+# start.sh runtime files
+local-proxy/config.json
+.run/

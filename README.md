@@ -1,145 +1,152 @@
 # Obsidian MCP Gateway
 
-**Let web LLMs (Claude.ai and DeepSeek) securely access your local Obsidian vault through a single public URL.**
+**Securely connect your local Obsidian vault to Claude.ai and DeepSeek — with one command.**
 
-[Obsidian](https://obsidian.md) is where your knowledge lives. Claude.ai and DeepSeek are where you do a lot of your thinking. This gateway connects the two: it puts a **production-grade OAuth 2.1 authorization server and an authenticated reverse proxy** in front of your local Obsidian MCP server, so a **web-based** LLM can reach a **machine on your laptop or homelab** — safely, with no port forwarding, no Tailscale, and no exposed unauthenticated endpoints.
+Your notes live on your computer. Claude.ai and DeepSeek live in the cloud. This project builds a safe, authenticated bridge between the two, so a web-based AI can **search and read your Obsidian notes** — without port forwarding, without a VPN, and without ever exposing your vault to the internet unprotected.
 
-```
-                        ┌──────────────────────────────────────────────────┐
-                        │                  Your machine                    │
-                        │                                                  │
-  Claude.ai ──OAuth 2.1─▶│  cloudflared ──▶ Gateway :3385 ──▶ Obsidian MCP  │
-  (PKCE + DCR + JWT)    │   (public URL)    dual auth     :8385 (/mcp)    │
-                        │                     ▲                           │
-  DeepSeek ─────────────┼─  local proxy :2006 ─┘ STATIC_API_KEY             │
-  (browser extension)  │                                                  │
-                        │      └──▶ your Obsidian vault (.md files)        │
-                        └──────────────────────────────────────────────────┘
+After a one-time setup, you start everything with:
+
+```bash
+./start.sh
 ```
 
-Both AI clients go through the **same public Cloudflare URL**:
-
-| Client | Auth method | How |
-|---|---|---|
-| **Claude.ai** (custom connector) | **OAuth 2.1** — PKCE (S256), Dynamic Client Registration, JWT access tokens | Claude talks to `/register`, `/authorize`, `/token` itself; you type a password once |
-| **DeepSeek** (via the MCP SuperAssistant browser extension) | **Static API key** — `Authorization: Bearer <STATIC_API_KEY>` | A tiny local proxy (`local-proxy/`) attaches the key for you |
-
-Anything else gets `401 Unauthorized` — which is also exactly what triggers Claude's OAuth flow.
+…and it prints the two URLs you paste into Claude and into the DeepSeek browser extension.
 
 ---
 
 ## Table of contents
 
-1. [How it works](#how-it-works)
-2. [Prerequisites](#prerequisites)
-3. [Step 1 — Obsidian setup](#step-1--obsidian-setup)
-4. [Step 2 — Cloudflare Tunnel setup](#step-2--cloudflare-tunnel-setup)
-5. [Step 3 — Deploy the gateway](#step-3--deploy-the-gateway)
-6. [Step 4 — Claude.ai setup](#step-4--claudeai-setup)
-7. [Step 5 — DeepSeek setup (MCP SuperAssistant)](#step-5--deepseek-setup-mcp-superassistant)
-8. [Testing locally](#testing-locally)
-9. [Troubleshooting](#troubleshooting)
-10. [Security notes](#security-notes)
+1. [Introduction](#1-introduction)
+2. [Prerequisites](#2-prerequisites)
+3. [Installation & setup](#3-installation--setup)
+4. [Running the stack](#4-running-the-stack)
+5. [Connecting Claude](#5-connecting-claude)
+6. [Connecting DeepSeek (MCP SuperAssistant)](#6-connecting-deepseek-mcp-superassistant)
+7. [Troubleshooting](#7-troubleshooting)
+8. [How it works (under the hood)](#8-how-it-works-under-the-hood)
+9. [Security notes](#9-security-notes)
+10. [Testing locally (for contributors)](#10-testing-locally-for-contributors)
 
 ---
 
-## How it works
+## 1. Introduction
 
-The gateway is a single Node.js process ([`src/index.js`](src/index.js)) with:
+### What it does
 
-| Route | Purpose |
-|---|---|
-| `GET /.well-known/oauth-authorization-server` | OAuth 2.1 discovery (RFC 8414) — how Claude finds the flow |
-| `GET /.well-known/oauth-protected-resource` | Protected-resource metadata (RFC 9728) |
-| `POST /register` | Dynamic Client Registration (RFC 7591) — Claude registers itself, no manual client-id copying |
-| `GET /authorize` | A simple, clean login page — you type your `MASTER_PASSWORD` |
-| `POST /authorize` | On success: single-use, 60-second authorization code bound to the client + PKCE challenge |
-| `POST /token` | PKCE (S256) code exchange → signed JWT access token (HS256, 12h) |
-| `/mcp`, `/sse`, `/message`, `/messages` | The reverse proxy to your Obsidian MCP — **dual-authenticated**, streaming, unbuffered |
+The **Model Context Protocol (MCP)** is the standard way AI assistants use external "tools" — in our case, tools like *search my vault* and *read this note*. This project:
 
-**The dual-auth middleware** (this is the heart of the project):
+1. Runs an **Obsidian MCP server** on your machine that talks to your vault through Obsidian's **Local REST API** plugin.
+2. Puts an **OAuth 2.1 gateway** in front of it, so only *you* can use it:
+   - **Claude.ai** signs in with a password you choose (full OAuth 2.1: PKCE, Dynamic Client Registration, signed JWT tokens).
+   - **DeepSeek** (via the MCP SuperAssistant extension) uses a secret **static API key** that a small local proxy attaches for you.
+3. Publishes the gateway on a **public HTTPS URL** through a **Cloudflare Tunnel** — no open ports on your router.
+4. Starts the **local proxy** for the DeepSeek extension.
 
-1. If the `Authorization: Bearer <token>` header **exactly equals `STATIC_API_KEY`** → allowed (local proxy / DeepSeek path).
-2. Else if the token **verifies as a JWT** signed with your `JWT_SECRET` and issued by your `PUBLIC_URL` → allowed (Claude path).
-3. Else → **`401` with `WWW-Authenticate: Bearer ...`**, which is precisely the signal that makes Claude start the OAuth flow.
+Everything speaks **MCP over SSE** (Server-Sent Events) on the `/sse` endpoint.
 
-Details that matter in production: PKCE verification and the password check are timing-safe; authorization codes are single-use and expire in 60s; `redirect_uri` must match a registered value exactly (no open redirects); registered clients are persisted to `data/state.json` so restarting the container does **not** force you to re-add the Claude connector; proxied request bodies are never parsed, only streamed; and SSE responses are marked `x-accel-buffering: no` so nothing in the chain buffers the event stream.
+### The data flow
 
-## Prerequisites
+```
+ Obsidian app                                   Your computer
+ ┌──────────────────────┐
+ │ Local REST API :27124│◀── Obsidian MCP server (Docker)
+ └──────────────────────┘          │
+                                   ▼
+                     MCP SSE endpoint  :8385  /sse
+                                   │
+                                   ▼
+                     OAuth 2.1 gateway :3385  (password / JWT / static key)
+                                   │
+                                   ▼
+                     Cloudflare Tunnel ───────▶  https://<your-public-url>/sse
+                                                     ▲                ▲
+                                     Claude.ai ──────┘                │
+                                     (OAuth sign-in)                  │
+                                                                      │
+                     Local proxy :2006 ───────────────────────────────┘
+                     (adds your STATIC_API_KEY)
+                           ▲
+                     MCP SuperAssistant Chrome extension (DeepSeek)
+```
 
-- **Obsidian** with your vault — <https://obsidian.md>
-- **An Obsidian MCP server** running locally over SSE (Step 1 shows two ways)
-- **Docker** (Docker Desktop, OrbStack, colima, Podman, or a plain Docker Engine) — <https://docs.docker.com/get-docker/>
-- **Node.js 18+** — only needed for the local DeepSeek proxy and the test scripts — <https://nodejs.org>
-- A **Claude.ai** account (connectors are a Claude feature) and/or a **DeepSeek** account
-- For a stable public URL: a **Cloudflare** account (free tier is fine) — no custom domain required, but a domain you own gives you a URL that never rotates
+| Port | What runs there | Reachable from |
+|---|---|---|
+| `27124` | Obsidian **Local REST API** plugin | your computer only |
+| `8385` | Obsidian **MCP server** (SSE: `/sse` + `/message`) | your computer only (`127.0.0.1`) |
+| `3385` | **OAuth gateway** | the Cloudflare Tunnel |
+| `2006` | **Local proxy** for the DeepSeek extension | your computer only |
+| public URL | Cloudflare Tunnel → gateway | the internet (authentication required) |
 
-## Step 1 — Obsidian setup
+---
 
-The gateway proxies an **SSE MCP server that talks to your vault**. Pick one of the two options below.
+## 2. Prerequisites
 
-> **Recommended reading:** the Model Context Protocol introduction — <https://modelcontextprotocol.io>
+You need four things: **Obsidian (with the Local REST API plugin)**, **Docker**, **Node.js**, and **cloudflared**. A Cloudflare account and domain are optional but recommended.
 
-### Option A (simplest): run an Obsidian MCP server as a Docker container
+### 2.1 Obsidian + the Local REST API plugin (required)
 
-This runs a containerized MCP server directly against your vault folder and serves SSE on port `8385`:
+The MCP server reads and writes your vault through this plugin.
+
+1. Install Obsidian if you haven't: <https://obsidian.md>
+2. Open your vault, then go to **Settings → Community plugins**.
+   - If you see "Restricted mode", click **Turn on community plugins**.
+3. Click **Browse**, search for **"Local REST API"** (by *coddingtonbear*), click **Install**, then **Enable**.
+   - Plugin GitHub: <https://github.com/coddingtonbear/obsidian-local-rest-api>
+   - Plugin docs: <https://coddingtonbear.github.io/obsidian-local-rest-api/>
+4. Open **Settings → Local REST API** (under *Community plugins* in the left sidebar):
+   - **Copy the API Key** shown at the top — you'll paste it into `.env` as `OBSIDIAN_API_KEY`. Treat it like a password.
+   - Confirm the **Encrypted (HTTPS) Server** is enabled on port **`27124`** (the default).
+5. **Your REST URL:** the MCP server runs inside Docker, where your computer is reachable as `host.docker.internal`. So your URL is:
+
+   ```
+   https://host.docker.internal:27124
+   ```
+
+   That's already the default value of `OBSIDIAN_REST_URL` in `.env.example` — you only change it if you changed the plugin's port.
+
+> **Keep Obsidian open** while you use the bridge — the REST API only runs while the Obsidian app is running.
+
+Quick check (from your computer's terminal — `-k` accepts the plugin's self-signed certificate):
 
 ```bash
-docker run -d --name obsidian-mcp \
-  --restart unless-stopped \
-  -p 8385:3000 \
-  -e VAULT_PATH=/vault \
-  -v "/absolute/path/to/your/vault:/vault" \
-  ghcr.io/smith-and-web/obsidian-mcp-server:latest
+curl -k https://127.0.0.1:27124/
 ```
 
-Verify it responds (it may require an `Accept: text/event-stream` header — that's expected for SSE):
+You should get a small JSON reply that includes `"status": "OK"`.
+
+### 2.2 Docker (required)
+
+The MCP server and the gateway run as Docker containers.
+
+- **Mac / Windows:** install **Docker Desktop** — <https://docs.docker.com/get-docker/> — then **open it** and wait until it says *Docker is running*.
+  (Alternatives such as OrbStack or colima also work on Mac.)
+- **Linux:** install Docker Engine + the Compose plugin — <https://docs.docker.com/engine/install/>
+
+Verify:
 
 ```bash
-curl -s -H 'Accept: text/event-stream' -m 3 http://127.0.0.1:8385/sse | head -n 2
+docker info > /dev/null && echo "Docker is running"
+docker compose version
 ```
 
-### Option B: any MCP server that talks to the "Local REST API" Obsidian plugin
+### 2.3 Node.js 18+ (required)
 
-Many Obsidian MCP servers read your vault through the **Local REST API** community plugin. Set it up like this:
+Used to run the local proxy (`npx`).
 
-1. In Obsidian: **Settings → Community plugins → Browse**, search for **"Local REST API"** (or install manually from its GitHub releases page — <https://github.com/coddingtonbear/obsidian-local-rest-api>).
-2. Install & **enable** the plugin.
-3. In the plugin's settings:
-   - Make sure the plugin is **on**;
-   - Note the **ports** for the non-secure (HTTP) and secure (HTTPS) interfaces (the plugin's defaults are shown in its settings — typically `27123` for HTTP and `27124` for HTTPS);
-   - Copy the **API key** shown at the top of the plugin settings — this is the key your MCP server will use to talk to Obsidian. Keep it secret.
-4. Plugin documentation: <https://coddingtonbear.github.io/obsidian-local-rest-api/>
+- Download: <https://nodejs.org> (choose the LTS version), or on Mac: `brew install node`
 
-Then run whichever Obsidian MCP server you prefer, giving it the plugin's URL and API key, and make sure it serves **SSE on a known port** (this README assumes `8385`). Set that URL in the gateway's `.env` as `OBSIDIAN_MCP_URL`.
-
-**Let `./start.sh` run it for you (recommended):** install & enable the **Local REST API** plugin (above), then put its API key in `.env`:
-
-```env
-OBSIDIAN_REST_API_KEY=<API key from Obsidian → Settings → Local REST API>
-OBSIDIAN_API_URL=https://host.docker.internal:27124   # the plugin's HTTPS port, as seen from Docker
-```
-
-`./start.sh` (Step 3) then runs this **first**, before anything else (values filled in from `.env`):
+Verify:
 
 ```bash
-docker run -d \
-  --name obsidian-mcp \
-  --restart unless-stopped \
-  --add-host host.docker.internal:host-gateway \
-  -p 127.0.0.1:8385:3000 \
-  -e API_KEY="$OBSIDIAN_REST_API_KEY" \
-  -e API_URLS='["'"$OBSIDIAN_API_URL"'"]' \
-  ghcr.io/oleksandrkucherenko/obsidian-mcp:latest
+node --version    # v18 or newer
+npx --version
 ```
 
-This server ([mcp-obsidian-via-rest](https://github.com/OleksandrKucherenko/mcp-obsidian-via-rest)) speaks MCP over **Streamable HTTP on `/mcp`** (not the older SSE `/sse` + `/message` transport), so the gateway URL for Claude ends in **`/mcp`**. Port `8385` is bound to `127.0.0.1` only — the gateway is the only public way in. The container is recreated on every `./start.sh` run so `.env` changes always apply, and the script waits until `http://127.0.0.1:8385/mcp` answers before starting anything else.
+### 2.4 Cloudflare Tunnel — `cloudflared` (required to install; account optional)
 
-## Step 2 — Cloudflare Tunnel setup
+`cloudflared` gives your gateway a public `https://` URL **without opening any ports**, and works behind home routers and CGNAT.
 
-A Cloudflare Tunnel (`cloudflared`) gives your local gateway a **public HTTPS URL** without opening any port, and works behind NAT/CGNAT. **Tailscale is not needed** (and not used) anywhere in this setup.
-
-### Install cloudflared
+**Install it:**
 
 **macOS (Homebrew):**
 
@@ -147,7 +154,7 @@ A Cloudflare Tunnel (`cloudflared`) gives your local gateway a **public HTTPS UR
 brew install cloudflared
 ```
 
-**Windows (winget):**
+**Windows (winget, in PowerShell):**
 
 ```powershell
 winget install --id Cloudflare.cloudflared
@@ -162,216 +169,338 @@ echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudf
 sudo apt-get update && sudo apt-get install cloudflared
 ```
 
-All downloads and package repos: <https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/>
+Other systems: <https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/>
 
-### Run a quick tunnel (no account needed)
+Verify: `cloudflared --version`
+
+**Now choose one of two modes:**
+
+#### Option A — Quick Tunnel (no account, zero setup)
+
+Do nothing else. Leave `CLOUDFLARE_TUNNEL_NAME` and `PUBLIC_URL` **empty** in `.env`, and `start.sh` will create a free URL like `https://random-words.trycloudflare.com` every time it runs.
+
+> ⚠️ The quick-tunnel URL **changes every time** you run `./start.sh`, so you'll need to update the Claude connector each time. Fine for trying it out; for daily use, choose Option B.
+
+#### Option B — Named Tunnel with your own domain (recommended, permanent URL)
+
+Requirements: a free Cloudflare account and a domain whose DNS is managed by Cloudflare.
+
+1. **Log in** (opens your browser; pick your domain to authorize):
+
+   ```bash
+   cloudflared tunnel login
+   ```
+
+2. **Create a tunnel** (choose any name; we use `obsidian-gateway`):
+
+   ```bash
+   cloudflared tunnel create obsidian-gateway
+   ```
+
+   This prints a **Tunnel ID** and creates a credentials file at `~/.cloudflared/<TUNNEL-ID>.json`.
+
+3. **Route a hostname to it** (creates the DNS record for you):
+
+   ```bash
+   cloudflared tunnel route dns obsidian-gateway obsidian.yourdomain.com
+   ```
+
+4. **Tell the tunnel where to send traffic** — create `~/.cloudflared/config.yml`:
+
+   ```yaml
+   tunnel: obsidian-gateway
+   credentials-file: /Users/YOU/.cloudflared/<TUNNEL-ID>.json   # Linux: /home/YOU/... · Windows: C:\Users\YOU\.cloudflared\...
+   ingress:
+     - hostname: obsidian.yourdomain.com
+       service: http://localhost:3385
+     - service: http_status:404
+   ```
+
+5. **Put the name and URL in `.env`** (next section):
+
+   ```env
+   CLOUDFLARE_TUNNEL_NAME=obsidian-gateway
+   PUBLIC_URL=https://obsidian.yourdomain.com
+   ```
+
+`start.sh` will then run `cloudflared tunnel run obsidian-gateway` for you in the background.
+
+> Already run the tunnel some other way (e.g. as a system service, or from another machine)? Leave `CLOUDFLARE_TUNNEL_NAME` empty and set only `PUBLIC_URL` — `start.sh` will use that URL and won't start a tunnel itself.
+
+Docs: [Quick tunnels](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/) · [Named tunnels](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/)
+
+---
+
+## 3. Installation & setup
+
+### 3.1 Get the code
 
 ```bash
-cloudflared tunnel --url http://localhost:3385
-```
-
-It prints a URL like:
-
-```
-https://random-words-here.trycloudflare.com
-```
-
-That URL now reaches your gateway (start it first — Step 3). **Save it** — it goes into `.env` as `PUBLIC_URL`.
-
-> ⚠️ Quick-tunnel URLs **rotate** every time you restart `cloudflared`. Great for testing; for a URL that survives restarts (and that you can safely put into Claude), use a custom domain — next section.
-
-### Map a custom domain (stable URL, recommended)
-
-If you own a domain on Cloudflare:
-
-1. Log in: `cloudflared tunnel login` (opens your browser to authorize)
-2. Create a named tunnel and route DNS to it:
-
-```bash
-cloudflared tunnel create obsidian-gateway
-cloudflared tunnel route dns obsidian-gateway mcp.yourdomain.com
-```
-
-3. Run it with a config file `/etc/cloudflared/config.yml` (or `~/.cloudflared/config.yml`):
-
-```yaml
-tunnel: obsidian-gateway
-credentials-file: /home/YOU/.cloudflared/<TUNNEL-ID>.json
-ingress:
-  - hostname: mcp.yourdomain.com
-    service: http://localhost:3385
-  - service: http_status:404
-```
-
-```bash
-cloudflared tunnel run obsidian-gateway
-```
-
-You now have a permanent `https://mcp.yourdomain.com` that points at the gateway. You can also create and manage tunnels with zero CLI setup in the **Zero Trust dashboard** (Networks → Tunnels) — it generates a token you can pass to `cloudflared tunnel run --token <token>`.
-
-- Quick tunnels: <https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/>
-- Named tunnels / dashboard: <https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/>
-- `cloudflared` reference: <https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/configure-tunnel/cloudflared-parameters/>
-
-## Step 3 — Deploy the gateway
-
-```bash
-git clone <this-repo-url> obsidian-mcp-gateway
+git clone https://github.com/Gowtham640/mcp-oauth-gateway.git obsidian-mcp-gateway
 cd obsidian-mcp-gateway
+```
+
+### 3.2 Create your `.env`
+
+```bash
 cp .env.example .env
 ```
 
-Edit `.env` and fill in the secrets:
+Open `.env` in any text editor and fill it in:
+
+| Variable | Required | What to put |
+|---|---|---|
+| `OBSIDIAN_REST_URL` | yes (default is fine) | `https://host.docker.internal:27124` |
+| `OBSIDIAN_API_KEY` | **yes** | The API key you copied from **Settings → Local REST API** |
+| `MASTER_PASSWORD` | **yes** | A strong password. You'll type it once on the login page when connecting Claude. |
+| `STATIC_API_KEY` | **yes** | A long random secret — generate it (below). The local proxy uses it for DeepSeek. |
+| `JWT_SECRET` | **yes** | Another long random secret — generate it (below). Used to sign Claude's access tokens. |
+| `CLOUDFLARE_TUNNEL_NAME` | optional | Your named tunnel (Option B). Empty = quick tunnel. |
+| `PUBLIC_URL` | optional | Your permanent URL (Option B), e.g. `https://obsidian.yourdomain.com`. Empty = quick tunnel. |
+
+**Generate the two secrets** (run the command twice — use a different value for each):
 
 ```bash
-# generate a strong static API key (macOS/Linux)
 openssl rand -hex 32
-# generate the JWT signing secret
-openssl rand -base64 48
 ```
 
-(On Windows PowerShell: `[Convert]::ToBase64String((1..48 | ForEach-Object { Get-Random -Maximum 256 }) -as [byte[]])` — or use any online base64 of random bytes.)
+On Windows PowerShell (if you don't have `openssl`):
 
-Then set in `.env`:
+```powershell
+-join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
+```
+
+A finished `.env` looks like:
 
 ```env
-MASTER_PASSWORD=a-strong-password-you-will-type-in-claude
-STATIC_API_KEY=<output of openssl rand -hex 32>
-JWT_SECRET=<output of openssl rand -base64 48>
-OBSIDIAN_MCP_URL=http://host.docker.internal:8385/mcp   # the MCP that ./start.sh runs
-OBSIDIAN_REST_API_KEY=<Local REST API plugin key>       # used by ./start.sh
-OBSIDIAN_API_URL=https://host.docker.internal:27124     # used by ./start.sh
-PUBLIC_URL=https://random-words-here.trycloudflare.com # EXACTLY the URL from Step 2
+OBSIDIAN_REST_URL=https://host.docker.internal:27124
+OBSIDIAN_API_KEY=3f9c...your-plugin-key...a1
+MASTER_PASSWORD=correct-horse-battery-staple-42
+STATIC_API_KEY=9b1e4c...64 hex characters...
+JWT_SECRET=d07a2f...64 hex characters...
+CLOUDFLARE_TUNNEL_NAME=
+PUBLIC_URL=
 ```
 
-> **`PUBLIC_URL` must match the URL the AI clients use, character for character** (including any port like `:8443` if your tunnel URL has one). It becomes the OAuth *issuer*. If you change the tunnel URL later, update `PUBLIC_URL` and restart — previously issued tokens stop verifying by design, and you re-authenticate once.
+> 🔒 `.env` contains secrets. It is already listed in `.gitignore` — **never commit it or share it**.
 
-Build and start everything with one command:
+---
+
+## 4. Running the stack
+
+Make the script executable (first time only) and run it:
 
 ```bash
+chmod +x start.sh
 ./start.sh
 ```
 
-It runs, in order:
+It does everything, in order, and stops with a clear message if any step fails:
 
-1. **Obsidian MCP** — the `docker run … ghcr.io/oleksandrkucherenko/obsidian-mcp:latest` command from Step 1, with `API_KEY` = `OBSIDIAN_REST_API_KEY` and `API_URLS` = `[OBSIDIAN_API_URL]` from `.env`; then waits until `:8385/mcp` answers. If it never comes up, the script stops here — nothing else is started.
-2. **Gateway + local proxy** — `docker compose up -d --build`. The `local-proxy` service starts the MCP SuperAssistant proxy on `http://localhost:2006`, pointed at `PUBLIC_URL/mcp` (Streamable HTTP) with `Authorization: Bearer STATIC_API_KEY` (both from `.env`, no `config.json` needed).
-3. **Prints the URLs to paste:**
+| Step | What happens |
+|---|---|
+| 1. Environment check | Verifies `.env` exists and is filled in (creates it from `.env.example` if missing), and that Docker, Node.js, and `cloudflared` are available. |
+| 2. Obsidian MCP server | Removes any old `obsidian-mcp` container and starts a fresh one connected to your Local REST API, exposed as an **SSE** endpoint on `http://127.0.0.1:8385/sse`. Waits until it answers. |
+| 3. Cloudflare Tunnel | Starts your named tunnel, **or** a quick tunnel and captures its `trycloudflare.com` URL as `PUBLIC_URL`. |
+| 4. OAuth gateway | `docker compose up -d --build`, then waits until the gateway reports **healthy** and checks that unauthenticated access is refused (`401`). |
+| 5. Proxy config | Writes `local-proxy/config.json` pointing at `${PUBLIC_URL}/sse` with your `STATIC_API_KEY`. |
+| 6. Local proxy | Starts the MCP SuperAssistant proxy on `http://localhost:2006` in the background and waits for it to connect. |
+| 7. Summary | Prints the URLs you need. |
+
+When it finishes you'll see:
 
 ```
-  Claude.ai connector URL : https://<PUBLIC_URL>/mcp
-  Extension (other LLMs)  : http://localhost:2006/sse
+==> 7/7  All set
+
+  Claude.ai connector URL : https://<your-public-url>/sse
+  DeepSeek extension URL  : http://localhost:2006/sse
+
+  Logs : .run/cloudflared.log · .run/proxy.log · docker compose logs -f
+  Stop : ./start.sh stop
 ```
 
-(`docker compose up -d --build` alone still works if your MCP server is already running; the URLs are also shown in `docker compose logs local-proxy`.)
-
-Verify:
+**Useful commands**
 
 ```bash
-curl -s http://127.0.0.1:3385/healthz
-# {"ok":true,"issuer":"https://...","upstream":"http://host.docker.internal:8385"}
-
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3385/mcp
-# 401  ← correct! unauthenticated access is refused
+./start.sh                 # start, or restart everything after changing .env
+./start.sh stop            # stop everything start.sh started
+docker compose logs -f     # gateway logs
+tail -f .run/proxy.log     # local proxy logs
+tail -f .run/cloudflared.log
+docker logs -f obsidian-mcp
 ```
 
-The gateway is now live, registered OAuth clients persist in `./data`, and the containers auto-restart.
+> Re-running `./start.sh` is always safe — it cleans up the previous run first.
 
-## Step 4 — Claude.ai setup
+---
 
-1. Go to **Claude.ai → Settings → Connectors → Add a custom connector**.
-2. In the **Remote MCP server URL** field, paste:
+## 5. Connecting Claude
+
+1. Open **Claude.ai** → click your name → **Settings** → **Connectors**.
+2. Click **Add custom connector**.
+3. **Name:** `Obsidian` (anything you like).
+4. **Remote MCP server URL:** paste the **Claude.ai connector URL** that `start.sh` printed — it **ends in `/sse`**, e.g.
 
    ```
-   https://YOUR-CLOUDFLARE-URL/mcp
-
-   (use `/sse` instead only if you run your own MCP server that speaks the legacy SSE transport)
+   https://obsidian.yourdomain.com/sse
    ```
 
-3. Leave **"Sign in now"** checked and choose **"Register automatically"** — this makes Claude use Dynamic Client Registration, so you never copy client IDs by hand.
-4. **About the red error (401):** after you add the connector, Claude may briefly show a **red error** saying it could not connect / got a 401. **This is expected and correct** — the gateway refuses unauthenticated MCP calls precisely so that the OAuth flow kicks in. Click **"Continue anyway"**. Claude will then:
-   - fetch `/.well-known/oauth-authorization-server`,
-   - register itself at `/register`,
-   - open the gateway's **login page** in your browser,
-5. Type your `MASTER_PASSWORD` on the login page and hit **Authorize access**.
-6. You are redirected back to Claude; the connector turns green/connected, and Claude can now read and search your Obsidian notes.
+5. Choose **Sign in now**, and for the OAuth client choose **Register automatically**. (Claude registers itself with the gateway — you never copy client IDs.)
+6. **About the red error — this is expected.** Claude first checks the URL *without* being signed in. The gateway correctly answers **`401 Unauthorized`** (that's it protecting your vault), and Claude shows a red message such as *"Couldn't reach this address"*. **Click "Continue anyway."**
+7. A login page titled **Obsidian MCP** opens. Type your **`MASTER_PASSWORD`** and click **Authorize access**.
+8. You're sent back to Claude and the connector shows as **connected**. In a chat, enable the Obsidian connector from the tools menu and try:
 
-> If you ever change `PUBLIC_URL`, `MASTER_PASSWORD` (logins), or the tunnel hostname, remove and re-add the connector in Claude — a 30-second fix.
+   > *"Search my Obsidian vault for notes about project ideas."*
 
-## Step 5 — DeepSeek setup (MCP SuperAssistant)
+> Using a **quick tunnel**? The URL changes on every `./start.sh` run — remove the old connector and add a new one with the new URL. Using a **named tunnel**, the connector keeps working across restarts (you may need to sign in again after 12 hours, when the access token expires).
 
-DeepSeek (web) has no native MCP connector UI, so we use the **MCP SuperAssistant** browser extension, which lets web chat UIs use MCP servers, plus the tiny local proxy in `local-proxy/` that injects your static API key. Your machine → the same public URL as Claude, just with static-key auth.
+---
 
-> **If you used `./start.sh` (Step 3), the local proxy is already running** on `http://localhost:2006` as the `local-proxy` compose service — skip steps 2–3 below and go straight to step 4. The manual steps are for running the proxy outside Docker.
+## 6. Connecting DeepSeek (MCP SuperAssistant)
 
-1. **Install the browser extension:** search the Chrome Web Store for **"MCP SuperAssistant"** (<https://chromewebstore.google.com/search/MCP%20SuperAssistant>) and add it to Chrome (or a Chromium browser).
-2. **Configure the local proxy:**
+DeepSeek's website has no built-in MCP support, so we use the **MCP SuperAssistant** Chrome extension. It talks to the **local proxy** that `start.sh` already started on port `2006`, which attaches your `STATIC_API_KEY` and forwards to the gateway.
 
-   ```bash
-   cd local-proxy
-   cp config.json.example config.json
-   ```
-
-   Edit `config.json`:
-
-   ```json
-   {
-     "mcpServers": {
-       "obsidian": {
-         "type": "streamable-http",
-         "url": "https://YOUR-CLOUDFLARE-URL/mcp",
-         "headers": {
-           "Authorization": "Bearer YOUR_STATIC_API_KEY"
-         }
-       }
-     }
-   }
-   ```
-
-   — the exact same Cloudflare URL as Claude uses, but with the `STATIC_API_KEY` from your `.env`.
-
-3. **Start the proxy** (requires Node.js 18+):
-
-   **macOS / Linux:**
-
-   ```bash
-   chmod +x start-mac-linux.sh
-   ./start-mac-linux.sh
-   ```
-
-   **Windows (PowerShell):**
-
-   ```powershell
-   .\start-windows.ps1
-   ```
-
-   Both scripts run:
-
-   ```bash
-   npx -y @srbhptl39/mcp-superassistant-proxy@latest --config ./config.json --port 2006
-   ```
-
-   and the proxy starts listening on `http://localhost:2006`.
-
-4. **Point the extension at the local proxy:** in the MCP SuperAssistant extension settings, add an MCP server with URL:
+1. **Install the extension** in Chrome (or any Chromium browser — Edge, Brave, Arc): search the Chrome Web Store for **"MCP SuperAssistant"** — <https://chromewebstore.google.com/search/MCP%20SuperAssistant> — and click **Add to Chrome**.
+2. Open <https://chat.deepseek.com>. The MCP SuperAssistant sidebar/button appears on the page.
+3. Open the extension's **server settings** and set the server URL to:
 
    ```
    http://localhost:2006/sse
    ```
 
-   (keep the local proxy terminal window running while you use DeepSeek).
+4. Click **Reconnect**. The status turns **Connected** and the Obsidian tools appear in the extension's tool list.
+5. **Teach DeepSeek about the tools — "Insert Instructions":** web models don't know they have tools unless told. In the extension, open the **Instructions** tab and click **Insert Instructions**. This pastes a prompt into the chat box that describes the available tools and how to call them. Send it (or send it together with your question) at the start of each new chat.
+6. **"Push Content Mode":** turn this **on** in the extension. When DeepSeek writes a tool call in its answer, the extension runs it through the proxy and **pushes the result back into the conversation** automatically, so DeepSeek can continue with the real data from your vault. It also lets you push the content of the page you're viewing into the chat as context.
+7. Try it:
 
-5. **Use it with DeepSeek:**
-   - **Push Content Mode** — with a page open (an article, docs, anything), use the extension to *push* the current page's content into the DeepSeek conversation. Now DeepSeek can answer questions about it, and — because your Obsidian MCP server is also connected through the same proxy — it can pull your own notes in as context ("what do my notes say about X?").
-   - **Insert Instructions** — use the extension to insert a reusable prompt/instruction template into the chat input before you send. Handy for your standard "answer using my vault" prompts: insert the instructions, then send the question.
+   > *"Use the obsidian tool to list the files in my vault."*
 
-## Testing locally
+> Keep `./start.sh`'s stack running while you use DeepSeek — the extension needs the local proxy on port 2006.
 
-Without touching a real vault or any public URL:
+---
+
+## 7. Troubleshooting
+
+First look at the logs — they usually say exactly what's wrong:
+
+```bash
+tail -n 50 .run/proxy.log
+tail -n 50 .run/cloudflared.log
+docker compose logs --tail 50
+docker logs --tail 50 obsidian-mcp
+```
+
+### `ECONNREFUSED`
+
+Something in the chain can't reach the next hop.
+
+- **Obsidian is not running** (most common) — the Local REST API only works while the Obsidian app is open. Open Obsidian, then re-run `./start.sh`.
+- **The plugin is disabled or on another port** — check **Settings → Local REST API**; the HTTPS server must be on, on the port in `OBSIDIAN_REST_URL` (default `27124`). Test with `curl -k https://127.0.0.1:27124/`.
+- **Wrong `OBSIDIAN_API_KEY`** — copy it again from the plugin settings (re-generating it in the plugin invalidates the old one).
+- **The MCP server container stopped** — `docker ps` should list `obsidian-mcp`; check `docker logs obsidian-mcp`.
+- **Gateway log says `Upstream MCP unreachable: ECONNREFUSED`** — the MCP SSE endpoint on `:8385` is down; re-run `./start.sh`.
+
+### `Streamable HTTP error`
+
+This stack **strictly uses SSE on `/sse`**. If you see `Streamable HTTP error` or any mention of `/mcp`, something is configured for the other MCP transport:
+
+- Open `local-proxy/config.json` — the `url` **must end in `/sse`** and `type` must be `"sse"`. Simply re-run `./start.sh`, which regenerates this file correctly.
+- In Claude, the connector URL **must end in `/sse`**. Remove the connector and add it again with the URL `start.sh` printed.
+- In the extension, the server URL must be `http://localhost:2006/sse`.
+
+### `401 Unauthorized`
+
+- **When adding the Claude connector** — expected! Click **Continue anyway** (see [Connecting Claude](#5-connecting-claude)).
+- **In `.run/proxy.log` / DeepSeek** — the proxy's key doesn't match the gateway's: `STATIC_API_KEY` was changed in `.env` but the stack wasn't restarted, or `local-proxy/config.json` was edited by hand. Re-run `./start.sh` so both use the same key.
+- **Claude worked before, now asks to sign in again** — access tokens last 12 hours, or `PUBLIC_URL`/`JWT_SECRET` changed (which invalidates all tokens by design). Sign in again or re-add the connector.
+
+### Other common issues
+
+| Symptom | Fix |
+|---|---|
+| `Docker is not running` | Open Docker Desktop and wait until it's running. |
+| `Port 8385/2006 is already in use` | Another program uses the port. Run `./start.sh stop`, or find it with `lsof -i :2006`. |
+| `Could not get a quick-tunnel URL` with `no such host` | Your ISP's DNS blocks `trycloudflare.com`. On macOS: `sudo mkdir -p /etc/resolver && echo 'nameserver 1.1.1.1' \| sudo tee /etc/resolver/trycloudflare.com` — or use a named tunnel. |
+| cloudflared: `failed to dial … i/o timeout` / `Failed to connect to Cloudflare edge` | Your network blocks QUIC/UDP. Add `protocol: http2` to `~/.cloudflared/config.yml` (named tunnel) or try another network. |
+| Cloudflare page **Error 1033** on your URL | The tunnel isn't running. Check `.run/cloudflared.log` and `CLOUDFLARE_TUNNEL_NAME`. |
+| Claude stays red / keeps asking to sign in | `PUBLIC_URL` must match the connector URL exactly (scheme, host, port). Fix `.env`, re-run `./start.sh`, re-add the connector. |
+| `zsh: event not found` when pasting a command | zsh treats `!` specially. Wrap values in single quotes, or run `setopt no_hist_expand`. |
+| DeepSeek ignores the tools | Click **Insert Instructions** and enable **Push Content Mode** (Section 6). |
+| `/register` fails with `EACCES` (Linux) | `sudo chown -R 100:101 ./data` — the folder was created as root by Docker. |
+
+---
+
+## 8. How it works (under the hood)
+
+### The gateway (`src/index.js`)
+
+A single Node.js/Express process that is both an **OAuth 2.1 authorization server** and an **authenticated, unbuffered reverse proxy**:
+
+| Route | Purpose |
+|---|---|
+| `GET /healthz` | Health check (used by Docker and `start.sh`) |
+| `GET /.well-known/oauth-authorization-server` | OAuth discovery (RFC 8414) — how Claude finds the login flow |
+| `GET /.well-known/oauth-protected-resource` | Protected-resource metadata (RFC 9728) |
+| `POST /register` | Dynamic Client Registration (RFC 7591) |
+| `GET /authorize` | The login page (your `MASTER_PASSWORD`) |
+| `POST /authorize` | Issues a single-use, 60-second authorization code |
+| `POST /token` | PKCE (S256) code exchange → signed JWT access token (HS256, 12 h) |
+| `/sse`, `/message`, `/messages` | The **dual-authenticated** SSE proxy to the MCP server |
+
+**Dual authentication** on every MCP request:
+
+1. `Authorization: Bearer <token>` **equals `STATIC_API_KEY`** → allowed (local proxy / DeepSeek).
+2. Otherwise the token must be a **valid JWT** signed with `JWT_SECRET` and issued by `PUBLIC_URL` → allowed (Claude).
+3. Anything else → **`401`** with `WWW-Authenticate: Bearer …` — the signal that starts Claude's OAuth sign-in.
+
+Registered OAuth clients are saved in `./data/state.json`, so restarting does not force you to re-add the Claude connector.
+
+### The MCP server on `:8385`
+
+`start.sh` runs a single container, `obsidian-mcp`, from [`ghcr.io/oleksandrkucherenko/obsidian-mcp`](https://github.com/OleksandrKucherenko/mcp-obsidian-via-rest). It provides three tools — `obsidian_search`, `obsidian_semantic_search`, and `get_note_content` — by calling the Local REST API with your `OBSIDIAN_API_KEY`.
+
+Inside that container, [`scripts/sse-adapter.js`](scripts/sse-adapter.js) (a tiny, dependency-free script) serves the standard **MCP SSE transport** on `127.0.0.1:8385`:
+
+- `GET /sse` opens an event stream whose first event (`endpoint`) tells the client where to post messages.
+- `POST /message?sessionId=…` delivers a JSON-RPC message; the reply arrives on the event stream.
+- **Every SSE connection gets its own MCP server process** (over stdio), so Claude, DeepSeek, and reconnects can all be connected at the same time without interfering. (The upstream image natively speaks MCP's newer Streamable-HTTP transport and accepts only one client per process — the adapter keeps the whole stack on SSE and multi-client.)
+
+The gateway reaches it over a private Docker network (`obsidian-mcp-net`) as `http://obsidian-mcp:8385/sse`.
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `start.sh` | One-command launcher (this README, Section 4) |
+| `.env.example` | Configuration template |
+| `src/index.js` | The gateway |
+| `scripts/sse-adapter.js` | MCP stdio → SSE adapter used by the `obsidian-mcp` container |
+| `Dockerfile`, `docker-compose.yml` | Gateway container (port 3385, healthcheck, `./data` volume) |
+| `local-proxy/config.json` | Generated by `start.sh` for the local proxy (git-ignored — contains your key) |
+| `local-proxy/start-*.sh/.ps1` | Optional: run the local proxy manually, without `start.sh` |
+| `scripts/` | Mock MCP server and end-to-end test |
+| `.run/` | Logs and process IDs of the background tunnel and proxy (git-ignored) |
+
+---
+
+## 9. Security notes
+
+- **Only the gateway is public.** The Local REST API (`27124`), the MCP server (`8385`), and the local proxy (`2006`) listen on your computer only. Every request that arrives through the tunnel must carry a valid token.
+- **OAuth 2.1 hardening:** PKCE S256 is mandatory (`plain` is rejected); authorization codes are single-use and expire in 60 s; `redirect_uri` must exactly match the registered value (no open redirects); password, static key, and PKCE comparisons are timing-safe; the login page allows 10 attempts per 10 minutes per IP.
+- **Secrets stay in `.env`** (git-ignored) and in `local-proxy/config.json` (git-ignored, created with permissions `600`).
+- **`STATIC_API_KEY` is a master key** for your vault via the gateway. Use it only in your own local proxy. To rotate it: change it in `.env` and re-run `./start.sh`.
+- **To log Claude out everywhere:** change `JWT_SECRET` and re-run `./start.sh` — every issued token stops working immediately.
+- The vault's contents (including any `Secrets/` folder) are reachable by whoever holds these credentials — choose a strong `MASTER_PASSWORD`.
+
+---
+
+## 10. Testing locally (for contributors)
+
+Run the full dual-auth test suite against a mock MCP server — no vault, no tunnel needed:
 
 ```bash
 npm install
-node scripts/mock-obsidian-mcp.js 8385 &          # fake Obsidian MCP server
+node scripts/mock-obsidian-mcp.js 8385 &          # fake MCP SSE server
 
 PUBLIC_URL=http://localhost:3385 \
 MASTER_PASSWORD=test-password \
@@ -383,48 +512,10 @@ PORT=3385 node src/index.js &                      # the gateway
 BASE=http://127.0.0.1:3385 \
 MASTER_PASSWORD=test-password \
 STATIC_API_KEY=test-static-key \
-node scripts/test-gateway.js                       # full dual-auth end-to-end test
+node scripts/test-gateway.js
 ```
 
-The test script walks the entire flow both ways: discovery → DCR → login (wrong + right password) → PKCE exchange → single-use code enforcement → `401`s for missing/invalid tokens → **SSE streaming with the static API key** → **SSE streaming with the OAuth JWT**. Expect `ALL CHECKS PASSED`.
-
-## Troubleshooting
-
-**cloudflared fails behind CGNAT ("dial udp ... i/o timeout", "Failed to connect to Cloudflare edge")**
-Your ISP puts you behind carrier-grade NAT and blocks the UDP/QUIC port `cloudflared` prefers. Fall back to plain TCP/443:
-
-```bash
-cloudflared tunnel --protocol http2 --url http://localhost:3385
-```
-
-**zsh: `event not found` when pasting commands or URLs with `!`**
-zsh expands `!` inside double quotes as history expansion. Your generated `STATIC_API_KEY`/`JWT_SECRET` or a pasted URL containing `!` will blow up. Use single quotes around such values (`curl -H 'Authorization: Bearer ...!'`) or disable history expansion for the session with `setopt no_hist_expand` (`set +H` in bash).
-
-**SSE requests hang / the AI client sees no tool events (buffering)**
-Something in the chain is buffering the event stream. The gateway already disables buffering (`x-accel-buffering: no`, no proxy timeouts, no body parsing on proxied routes). If you put anything else in front (nginx, Caddy, another proxy), turn off response buffering there (nginx: `proxy_buffering off;` and a long `proxy_read_timeout`). Test the stream yourself with `curl -N -H 'Accept: text/event-stream' -H 'Authorization: Bearer ...' https://YOUR-URL/sse` — you should see an `endpoint` event immediately, not after 30–60 seconds. Also make sure your MCP server sends periodic SSE keepalives, since idle timeouts exist on any public edge.
-
-**Claude keeps asking to sign in / connector stays red**
-`PUBLIC_URL` in `.env` does not exactly match the URL you pasted into Claude (protocol, host, and port must all match), or you changed the tunnel URL without restarting (`docker compose up -d`). Fix `.env`, restart, remove and re-add the connector.
-
-**`403 Forbidden` when curling the MCP server directly (Step 1)**
-SSE MCP servers commonly require `Accept: text/event-stream` on the request — send that header (see the Step 1 curl).
-
-**`host.docker.internal` does not resolve (Linux)**
-The provided `docker-compose.yml` already adds `extra_hosts: ["host.docker.internal:host-gateway"]`. If you run the container another way, add that flag, or point `OBSIDIAN_MCP_URL` directly at the MCP container.
-
-**Gateway starts but `/register` or writes fail with EACCES**
-The `./data` directory was created by Docker as root. Fix ownership so the container's non-root user can write: `sudo chown -R 100:101 ./data` (or make the dir yourself before the first `docker compose up`).
-
-**Quick-tunnel URL changed after reboot**
-Quick tunnels rotate by design. Either re-run `cloudflared tunnel --url http://localhost:3385`, update `PUBLIC_URL`, restart, and re-add the Claude connector — or switch to a named tunnel with a custom domain (Step 2), which never rotates.
-
-## Security notes
-
-- All secrets live in `.env` (**never commit it** — it is git-ignored) and are passed to the container as environment variables.
-- Your Obsidian MCP server stays bound to localhost — only the gateway is exposed, and it requires auth on every single MCP request.
-- OAuth: PKCE S256 mandatory (no `plain`), single-use 60s authorization codes, HS256 JWTs with `iss` = `PUBLIC_URL`, timing-safe password and code-verifier comparisons, exact `redirect_uri` matching, and a 10-attempts/10-minutes brute-force throttle on the login page.
-- The static API key path exists for your **own local proxy** only. Treat it like a password; rotate it by editing `.env` + `docker compose up -d`.
-- Add TLS at the edge only via the Cloudflare tunnel. Never expose port 3385 directly to the internet.
+It checks discovery → client registration → login (wrong + right password) → PKCE exchange → single-use codes → `401`s → SSE streaming with the static key → SSE streaming with the OAuth JWT. Expect **`ALL CHECKS PASSED`**.
 
 ---
 
