@@ -18,9 +18,14 @@ services:
       # HS256 secret for JWT access tokens. Generate: openssl rand -base64 48
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       # Your Obsidian MCP server (SSE). host.docker.internal reaches the host.
-      OBSIDIAN_MCP_URL: ${OBSIDIAN_MCP_URL:-http://host.docker.internal:8385/mcp}
+      OBSIDIAN_MCP_URL: ${OBSIDIAN_MCP_URL:-http://host.docker.internal:8385/sse}
       ACCESS_TOKEN_TTL_SECONDS: ${ACCESS_TOKEN_TTL_SECONDS:-43200}
       AUTH_CODE_TTL_SECONDS: ${AUTH_CODE_TTL_SECONDS:-60}
+    networks:
+      - default
+      # Private network shared with the MCP containers that ./start.sh runs
+      # (created by start.sh before this compose file is brought up).
+      - obsidian-mcp-net
     extra_hosts:
       # Makes host.docker.internal work on Linux hosts (Docker Desktop maps it natively).
       - "host.docker.internal:host-gateway"
@@ -35,29 +40,6 @@ services:
       start_period: 5s
       start_interval: 1s
 
-  # Local MCP SuperAssistant proxy for DeepSeek & other web LLMs (extension → http://localhost:2006/sse).
-  # Connects to PUBLIC_URL/mcp (Streamable HTTP) with Authorization: Bearer STATIC_API_KEY, both read from .env.
-  local-proxy:
-    image: node:22-alpine
-    container_name: obsidian-mcp-local-proxy
-    restart: unless-stopped
-    depends_on:
-      gateway:
-        condition: service_healthy
-    ports:
-      # Bound to localhost only — this port carries your API key upstream.
-      - "127.0.0.1:2006:2006"
-    environment:
-      PUBLIC_URL: ${PUBLIC_URL:?Set PUBLIC_URL in .env}
-      STATIC_API_KEY: ${STATIC_API_KEY:?Set STATIC_API_KEY in .env}
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        node -e '
-          const base = process.env.PUBLIC_URL.replace(/\/+$$/, "");
-          const cfg = { mcpServers: { obsidian: { type: "streamable-http", url: base + "/mcp", headers: { Authorization: "Bearer " + process.env.STATIC_API_KEY } } } };
-          require("fs").writeFileSync("/tmp/config.json", JSON.stringify(cfg, null, 2));
-          console.log("Claude.ai connector URL : " + base + "/mcp");
-          console.log("Extension (other LLMs)  : http://localhost:2006/sse");
-        '
-        exec npx -y @srbhptl39/mcp-superassistant-proxy@latest --config /tmp/config.json --port 2006 --host 0.0.0.0
+networks:
+  obsidian-mcp-net:
+    external: true
