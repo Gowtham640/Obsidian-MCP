@@ -5,6 +5,7 @@
 data
 node_modules
 scripts
+local-proxy
 Dockerfile
 docker-compose.yml
 README.md

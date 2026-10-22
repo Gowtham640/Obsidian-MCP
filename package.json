@@ -1,23 +1,24 @@
 {
-  "name": "mcp-oauth-gateway",
+  "name": "obsidian-mcp-gateway",
   "version": "1.0.0",
-  "description": "OAuth 2.1 authorization server + authenticated reverse proxy in front of an unauthenticated SSE MCP server (built for Claude.ai custom connectors: PKCE S256 + Dynamic Client Registration + JWT bearer).",
-  "main": "src/server.js",
+  "description": "Let web LLMs (Claude.ai, DeepSeek) securely access a local Obsidian vault MCP server through a single public URL — OAuth 2.1 (PKCE S256 + Dynamic Client Registration) for Claude, static API key for local proxies, and an unbuffered SSE reverse proxy.",
+  "main": "src/index.js",
   "type": "commonjs",
-  "private": true,
+  "private": false,
+  "license": "MIT",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
-    "smoke": "node scripts/smoke.js"
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "mock": "node scripts/mock-obsidian-mcp.js",
+    "test:e2e": "node scripts/test-gateway.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=18"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
-    "http-proxy": "^1.18.1",
+    "http-proxy-middleware": "^3.0.3",
     "jose": "^5.9.6"
-  },
-  "license": "MIT"
+  }
 }

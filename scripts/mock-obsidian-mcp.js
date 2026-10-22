@@ -2,10 +2,12 @@
 'use strict';
 
 /**
- * Minimal fake MCP SSE server for testing the gateway without touching the
- * real Obsidian MCP. Serves /sse (event stream) and /message (echo).
+ * Mock Obsidian MCP server (SSE) for local testing — no vault needed.
  *
- *   node scripts/dummy-upstream.js [port]      (default 8385)
+ *   node scripts/mock-obsidian-mcp.js [port]     (default 8385)
+ *
+ * Serves /sse (event stream advertising /message?sessionId=...) and
+ * /message (echo). Use it together with scripts/test-gateway.js.
  */
 
 const http = require('node:http');
@@ -19,9 +21,9 @@ const server = http.createServer((req, res) => {
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
     });
-    res.write('event: endpoint\ndata: /message?sessionId=demo\n\n');
+    res.write(`event: endpoint\ndata: /message?sessionId=mock-${Date.now()}\n\n`);
     let n = 0;
-    const timer = setInterval(() => res.write(`event: ping\ndata: ${++n}\n\n`), 1000);
+    const timer = setInterval(() => res.write(`event: keepalive\ndata: ${++n}\n\n`), 1000);
     req.on('close', () => clearInterval(timer));
     return;
   }
@@ -39,5 +41,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(port, '127.0.0.1', () => {
-  console.log(`dummy upstream MCP listening on http://127.0.0.1:${port}`);
+  console.log(`mock Obsidian MCP listening on http://127.0.0.1:${port}`);
 });
