@@ -1,7 +1,8 @@
 {
   "mcpServers": {
     "obsidian": {
-      "url": "https://YOUR-CLOUDFLARE-URL/sse",
+      "type": "streamable-http",
+      "url": "https://YOUR-CLOUDFLARE-URL/mcp",
       "headers": {
         "Authorization": "Bearer YOUR_STATIC_API_KEY"
       }
