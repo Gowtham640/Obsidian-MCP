@@ -2,7 +2,7 @@
 
 **Securely connect your local Obsidian vault to Claude.ai and DeepSeek — with one command.**
 
-Your notes live on your computer. Claude.ai and DeepSeek live in the cloud. This project builds a safe, authenticated bridge between the two, so a web-based AI can **search and read your Obsidian notes** — without port forwarding, without a VPN, and without ever exposing your vault to the internet unprotected.
+Your notes live on your computer. Claude.ai and DeepSeek live in the cloud. This project builds a safe, authenticated bridge between the two, so a web-based AI can **search, read, create, and edit your Obsidian notes** (31 tools) — without port forwarding, without a VPN, and without ever exposing your vault to the internet unprotected.
 
 After a one-time setup, you start everything with:
 
@@ -33,9 +33,9 @@ After a one-time setup, you start everything with:
 
 ### What it does
 
-The **Model Context Protocol (MCP)** is the standard way AI assistants use external "tools" — in our case, tools like *search my vault* and *read this note*. This project:
+The **Model Context Protocol (MCP)** is the standard way AI assistants use external "tools" — in our case 31 tools such as *search the vault*, *read a note*, *create/edit a note*, *manage tags*, and *find backlinks*. This project:
 
-1. Runs an **Obsidian MCP server** on your machine that talks to your vault through Obsidian's **Local REST API** plugin.
+1. Runs an **Obsidian MCP server** on your machine that works directly on your vault folder (no Obsidian plugin needed).
 2. Puts an **OAuth 2.1 gateway** in front of it, so only *you* can use it:
    - **Claude.ai** signs in with a password you choose (full OAuth 2.1: PKCE, Dynamic Client Registration, signed JWT tokens).
    - **DeepSeek** (via the MCP SuperAssistant extension) uses a secret **static API key** that a small local proxy attaches for you.
@@ -47,9 +47,9 @@ Everything speaks **MCP over SSE** (Server-Sent Events) on the `/sse` endpoint.
 ### The data flow
 
 ```
- Obsidian app                                   Your computer
+ Your vault                                     Your computer
  ┌──────────────────────┐
- │ Local REST API :27124│◀── Obsidian MCP server (Docker)
+ │ Vault folder (.md)   │◀── Obsidian MCP server (Docker, 31 tools)
  └──────────────────────┘          │
                                    ▼
                      MCP SSE endpoint  :8385  /sse
@@ -71,7 +71,6 @@ Everything speaks **MCP over SSE** (Server-Sent Events) on the `/sse` endpoint.
 
 | Port | What runs there | Reachable from |
 |---|---|---|
-| `27124` | Obsidian **Local REST API** plugin | your computer only |
 | `8385` | Obsidian **MCP server** (SSE: `/sse` + `/message`) | your computer only (`127.0.0.1`) |
 | `3385` | **OAuth gateway** | the Cloudflare Tunnel |
 | `2006` | **Local proxy** for the DeepSeek extension | your computer only |
@@ -81,38 +80,30 @@ Everything speaks **MCP over SSE** (Server-Sent Events) on the `/sse` endpoint.
 
 ## 2. Prerequisites
 
-You need four things: **Obsidian (with the Local REST API plugin)**, **Docker**, **Node.js**, and **cloudflared**. A Cloudflare account and domain are optional but recommended.
+You need four things: **an Obsidian vault**, **Docker**, **Node.js**, and **cloudflared**. A Cloudflare account and domain are optional but recommended.
 
-### 2.1 Obsidian + the Local REST API plugin (required)
+### 2.1 Your Obsidian vault (required)
 
-The MCP server reads and writes your vault through this plugin.
+The MCP server works **directly on your vault folder** — the folder Obsidian opens, which contains a hidden `.obsidian/` subfolder. No Obsidian plugin is required, and Obsidian doesn't even need to be running.
 
 1. Install Obsidian if you haven't: <https://obsidian.md>
-2. Open your vault, then go to **Settings → Community plugins**.
-   - If you see "Restricted mode", click **Turn on community plugins**.
-3. Click **Browse**, search for **"Local REST API"** (by *coddingtonbear*), click **Install**, then **Enable**.
-   - Plugin GitHub: <https://github.com/coddingtonbear/obsidian-local-rest-api>
-   - Plugin docs: <https://coddingtonbear.github.io/obsidian-local-rest-api/>
-4. Open **Settings → Local REST API** (under *Community plugins* in the left sidebar):
-   - **Copy the API Key** shown at the top — you'll paste it into `.env` as `OBSIDIAN_API_KEY`. Treat it like a password.
-   - Confirm the **Encrypted (HTTPS) Server** is enabled on port **`27124`** (the default).
-5. **Your REST URL:** the MCP server runs inside Docker, where your computer is reachable as `host.docker.internal`. So your URL is:
+2. Find your vault's folder: in Obsidian, open the vault switcher (bottom-left vault name → **Manage vaults**) and choose **Reveal vault in Finder/Explorer**, or right-click any note → **Reveal in Finder/Explorer**.
+3. Copy the **absolute path** of that folder — you'll put it in `.env` as `OBSIDIAN_VAULT_PATH`:
+   - macOS: `/Users/you/Documents/MyVault`
+   - Windows: `C:/Users/you/Documents/MyVault` (use forward slashes)
+   - Linux: `/home/you/MyVault`
 
-   ```
-   https://host.docker.internal:27124
-   ```
-
-   That's already the default value of `OBSIDIAN_REST_URL` in `.env.example` — you only change it if you changed the plugin's port.
-
-> **Keep Obsidian open** while you use the bridge — the REST API only runs while the Obsidian app is running.
-
-Quick check (from your computer's terminal — `-k` accepts the plugin's self-signed certificate):
+Quick check — this should list `.obsidian`:
 
 ```bash
-curl -k https://127.0.0.1:27124/
+ls -a "/Users/you/Documents/MyVault"
 ```
 
-You should get a small JSON reply that includes `"status": "OK"`.
+> The MCP server can **create, edit, move, and delete** notes. Back up your vault (or use Obsidian Sync / git) before connecting an AI to it.
+
+> **Docker Desktop file sharing:** the vault folder must be shareable with Docker. On macOS your home folder is shared by default; if your vault lives elsewhere, add it under **Docker Desktop → Settings → Resources → File sharing**.
+
+The server is [`ghcr.io/smith-and-web/obsidian-mcp-server`](https://github.com/smith-and-web/obsidian-mcp-server). Its 31 tools: `read-note`, `read-multiple-notes`, `create-note`, `edit-note`, `delete-note`, `move-note`, `duplicate-note`, `write-note`, `get-notes-info`, `create-directory`, `delete-directory`, `rename-directory`, `list-vault`, `get-frontmatter`, `update-frontmatter`, `add-tags`, `remove-tags`, `list-tags`, `find-notes-by-tag`, `search-missing-tag`, `audit-tags`, `search-vault`, `get-backlinks`, `find-broken-links`, `append-to-file`, `append-to-section`, `replace-section`, `insert-at-marker`, `read-section`, `list-headings`, `find-replace`.
 
 ### 2.2 Docker (required)
 
@@ -250,8 +241,7 @@ Open `.env` in any text editor and fill it in:
 
 | Variable | Required | What to put |
 |---|---|---|
-| `OBSIDIAN_REST_URL` | yes (default is fine) | `https://host.docker.internal:27124` |
-| `OBSIDIAN_API_KEY` | **yes** | The API key you copied from **Settings → Local REST API** |
+| `OBSIDIAN_VAULT_PATH` | **yes** | Absolute path to your vault folder (Section 2.1) |
 | `MASTER_PASSWORD` | **yes** | A strong password. You'll type it once on the login page when connecting Claude. |
 | `STATIC_API_KEY` | **yes** | A long random secret — generate it (below). The local proxy uses it for DeepSeek. |
 | `JWT_SECRET` | **yes** | Another long random secret — generate it (below). Used to sign Claude's access tokens. |
@@ -273,8 +263,7 @@ On Windows PowerShell (if you don't have `openssl`):
 A finished `.env` looks like:
 
 ```env
-OBSIDIAN_REST_URL=https://host.docker.internal:27124
-OBSIDIAN_API_KEY=3f9c...your-plugin-key...a1
+OBSIDIAN_VAULT_PATH=/Users/you/Documents/MyVault
 MASTER_PASSWORD=correct-horse-battery-staple-42
 STATIC_API_KEY=9b1e4c...64 hex characters...
 JWT_SECRET=d07a2f...64 hex characters...
@@ -300,7 +289,7 @@ It does everything, in order, and stops with a clear message if any step fails:
 | Step | What happens |
 |---|---|
 | 1. Environment check | Verifies `.env` exists and is filled in (creates it from `.env.example` if missing), and that Docker, Node.js, and `cloudflared` are available. |
-| 2. Obsidian MCP server | Removes any old `obsidian-mcp` container and starts a fresh one connected to your Local REST API, exposed as an **SSE** endpoint on `http://127.0.0.1:8385/sse`. Waits until it answers. |
+| 2. Obsidian MCP server | Removes any old `obsidian-mcp` container and starts a fresh one on your vault folder, serving **SSE** on `http://127.0.0.1:8385/sse`. Waits until it answers. |
 | 3. Cloudflare Tunnel | Starts your named tunnel, **or** a quick tunnel and captures its `trycloudflare.com` URL as `PUBLIC_URL`. |
 | 4. OAuth gateway | `docker compose up -d --build`, then waits until the gateway reports **healthy** and checks that unauthenticated access is refused (`401`). |
 | 5. Proxy config | Writes `local-proxy/config.json` pointing at `${PUBLIC_URL}/sse` with your `STATIC_API_KEY`. |
@@ -394,9 +383,8 @@ docker logs --tail 50 obsidian-mcp
 
 Something in the chain can't reach the next hop.
 
-- **Obsidian is not running** (most common) — the Local REST API only works while the Obsidian app is open. Open Obsidian, then re-run `./start.sh`.
-- **The plugin is disabled or on another port** — check **Settings → Local REST API**; the HTTPS server must be on, on the port in `OBSIDIAN_REST_URL` (default `27124`). Test with `curl -k https://127.0.0.1:27124/`.
-- **Wrong `OBSIDIAN_API_KEY`** — copy it again from the plugin settings (re-generating it in the plugin invalidates the old one).
+- **Wrong `OBSIDIAN_VAULT_PATH`** — it must be the absolute path of the vault folder (the one containing `.obsidian/`). `start.sh` stops with a clear message if the folder doesn't exist.
+- **Docker can't see the folder** — on Docker Desktop, make sure the vault's location is listed under **Settings → Resources → File sharing**.
 - **The MCP server container stopped** — `docker ps` should list `obsidian-mcp`; check `docker logs obsidian-mcp`.
 - **Gateway log says `Upstream MCP unreachable: ECONNREFUSED`** — the MCP SSE endpoint on `:8385` is down; re-run `./start.sh`.
 
@@ -457,15 +445,9 @@ Registered OAuth clients are saved in `./data/state.json`, so restarting does no
 
 ### The MCP server on `:8385`
 
-`start.sh` runs a single container, `obsidian-mcp`, from [`ghcr.io/oleksandrkucherenko/obsidian-mcp`](https://github.com/OleksandrKucherenko/mcp-obsidian-via-rest). It provides three tools — `obsidian_search`, `obsidian_semantic_search`, and `get_note_content` — by calling the Local REST API with your `OBSIDIAN_API_KEY`.
+`start.sh` runs one container, `obsidian-mcp`, from [`ghcr.io/smith-and-web/obsidian-mcp-server`](https://github.com/smith-and-web/obsidian-mcp-server) — the same image and settings as the project's reference deployment. Your vault folder is mounted at `/vault` (`VAULT_PATH=/vault`), and the server natively serves the **MCP SSE transport** (`GET /sse` + `POST /message?sessionId=…`) with 31 vault tools. Several clients (Claude and DeepSeek) can be connected at the same time.
 
-Inside that container, [`scripts/sse-adapter.js`](scripts/sse-adapter.js) (a tiny, dependency-free script) serves the standard **MCP SSE transport** on `127.0.0.1:8385`:
-
-- `GET /sse` opens an event stream whose first event (`endpoint`) tells the client where to post messages.
-- `POST /message?sessionId=…` delivers a JSON-RPC message; the reply arrives on the event stream.
-- **Every SSE connection gets its own MCP server process** (over stdio), so Claude, DeepSeek, and reconnects can all be connected at the same time without interfering. (The upstream image natively speaks MCP's newer Streamable-HTTP transport and accepts only one client per process — the adapter keeps the whole stack on SSE and multi-client.)
-
-The gateway reaches it over a private Docker network (`obsidian-mcp-net`) as `http://obsidian-mcp:8385/sse`.
+It's published on `127.0.0.1:8385` for local debugging; the gateway reaches it over a private Docker network (`obsidian-mcp-net`) at `http://obsidian-mcp:3000/sse`.
 
 ### Files
 
@@ -474,7 +456,6 @@ The gateway reaches it over a private Docker network (`obsidian-mcp-net`) as `ht
 | `start.sh` | One-command launcher (this README, Section 4) |
 | `.env.example` | Configuration template |
 | `src/index.js` | The gateway |
-| `scripts/sse-adapter.js` | MCP stdio → SSE adapter used by the `obsidian-mcp` container |
 | `Dockerfile`, `docker-compose.yml` | Gateway container (port 3385, healthcheck, `./data` volume) |
 | `local-proxy/config.json` | Generated by `start.sh` for the local proxy (git-ignored — contains your key) |
 | `local-proxy/start-*.sh/.ps1` | Optional: run the local proxy manually, without `start.sh` |
@@ -485,7 +466,7 @@ The gateway reaches it over a private Docker network (`obsidian-mcp-net`) as `ht
 
 ## 9. Security notes
 
-- **Only the gateway is public.** The Local REST API (`27124`), the MCP server (`8385`), and the local proxy (`2006`) listen on your computer only. Every request that arrives through the tunnel must carry a valid token.
+- **Only the gateway is public.** The MCP server (`8385`) and the local proxy (`2006`) listen on your computer only. Every request that arrives through the tunnel must carry a valid token.
 - **OAuth 2.1 hardening:** PKCE S256 is mandatory (`plain` is rejected); authorization codes are single-use and expire in 60 s; `redirect_uri` must exactly match the registered value (no open redirects); password, static key, and PKCE comparisons are timing-safe; the login page allows 10 attempts per 10 minutes per IP.
 - **Secrets stay in `.env`** (git-ignored) and in `local-proxy/config.json` (git-ignored, created with permissions `600`).
 - **`STATIC_API_KEY` is a master key** for your vault via the gateway. Use it only in your own local proxy. To rotate it: change it in `.env` and re-run `./start.sh`.

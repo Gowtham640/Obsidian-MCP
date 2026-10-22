@@ -2,9 +2,8 @@
 #
 # start.sh — one command to bring up the whole Obsidian → Web-LLM bridge.
 #
-#   Obsidian Local REST API (:27124)
-#     → Obsidian MCP           (docker: obsidian-mcp, internal)
-#     → SSE adapter      :8385 (docker: obsidian-mcp-sse — serves /sse + /message)
+#   Obsidian vault folder (OBSIDIAN_VAULT_PATH)
+#     → Obsidian MCP     :8385 (docker: obsidian-mcp — SSE /sse + /message, 31 tools)
 #     → OAuth gateway    :3385 (docker compose)
 #     → Cloudflare Tunnel      (public https URL)
 #     → Local proxy      :2006 (npx mcp-superassistant-proxy)
@@ -18,7 +17,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # ----------------------------------------------------------------- constants
-MCP_IMAGE="ghcr.io/oleksandrkucherenko/obsidian-mcp:latest"
+MCP_IMAGE="ghcr.io/smith-and-web/obsidian-mcp-server:latest"   # 31 vault tools, native SSE
 PROXY_PKG="@srbhptl39/mcp-superassistant-proxy@latest"
 DOCKER_NET="obsidian-mcp-net"
 MCP_CONTAINER="obsidian-mcp"
@@ -105,9 +104,8 @@ for bin in docker curl node npx cloudflared lsof; do
 done
 docker info >/dev/null 2>&1 || die "Docker is not running. Start Docker Desktop (or colima/OrbStack) and retry."
 
-OBSIDIAN_REST_URL="$(env_get OBSIDIAN_REST_URL)"
-OBSIDIAN_REST_URL="${OBSIDIAN_REST_URL:-https://host.docker.internal:27124}"
-OBSIDIAN_API_KEY="$(env_get OBSIDIAN_API_KEY)"
+OBSIDIAN_VAULT_PATH="$(env_get OBSIDIAN_VAULT_PATH)"
+OBSIDIAN_VAULT_PATH="${OBSIDIAN_VAULT_PATH/#\~/$HOME}"
 MASTER_PASSWORD="$(env_get MASTER_PASSWORD)"
 STATIC_API_KEY="$(env_get STATIC_API_KEY)"
 JWT_SECRET="$(env_get JWT_SECRET)"
@@ -115,15 +113,17 @@ CLOUDFLARE_TUNNEL_NAME="$(env_get CLOUDFLARE_TUNNEL_NAME)"
 PUBLIC_URL="$(env_get PUBLIC_URL)"; PUBLIC_URL="${PUBLIC_URL%/}"
 
 missing=()
-for v in OBSIDIAN_API_KEY MASTER_PASSWORD STATIC_API_KEY JWT_SECRET; do
+for v in OBSIDIAN_VAULT_PATH MASTER_PASSWORD STATIC_API_KEY JWT_SECRET; do
   val="${!v}"
-  case "$val" in ""|your_*|choose_*|generate_*) missing+=("$v") ;; esac
+  case "$val" in ""|your_*|choose_*|generate_*|/absolute/path/*) missing+=("$v") ;; esac
 done
 [ "${#missing[@]}" -eq 0 ] || die "Fill in these values in .env first: ${missing[*]}"
 if [ -n "$CLOUDFLARE_TUNNEL_NAME" ] && [ -z "$PUBLIC_URL" ]; then
   die "CLOUDFLARE_TUNNEL_NAME is set, so PUBLIC_URL must be set too (e.g. https://obsidian.yourdomain.com)."
 fi
-ok ".env loaded"
+[ -d "$OBSIDIAN_VAULT_PATH" ] || die "OBSIDIAN_VAULT_PATH is not a folder: $OBSIDIAN_VAULT_PATH"
+[ -d "$OBSIDIAN_VAULT_PATH/.obsidian" ] || warn "No .obsidian/ folder in $OBSIDIAN_VAULT_PATH — is this really your vault?"
+ok ".env loaded (vault: $OBSIDIAN_VAULT_PATH)"
 
 mkdir -p "$RUN_DIR"
 
@@ -134,25 +134,20 @@ docker rm -f "$SSE_CONTAINER" "$MCP_CONTAINER" >/dev/null 2>&1 || true
 docker network inspect "$DOCKER_NET" >/dev/null 2>&1 || docker network create "$DOCKER_NET" >/dev/null
 if port_busy "$MCP_PORT"; then die "Port $MCP_PORT is already in use by another program: $(lsof -nP -iTCP:$MCP_PORT -sTCP:LISTEN | tail -n1)"; fi
 
-# scripts/sse-adapter.js serves a strict MCP SSE endpoint (GET /sse + POST
-# /message) on :8385 and gives every SSE connection its own Obsidian MCP server
-# process over stdio — so Claude and DeepSeek can be connected at the same time.
+# The same MCP server image as the reference homelab deployment: it reads and
+# writes the vault folder directly and serves MCP over SSE (/sse + /message).
 docker run -d \
   --name "$MCP_CONTAINER" \
   --restart unless-stopped \
   --network "$DOCKER_NET" \
-  --add-host host.docker.internal:host-gateway \
-  -p "127.0.0.1:$MCP_PORT:$MCP_PORT" \
-  -e API_KEY="$OBSIDIAN_API_KEY" \
-  -e API_URLS="[\"$OBSIDIAN_REST_URL\"]" \
-  -e MCP_TRANSPORTS=stdio \
-  -v "$PWD/scripts/sse-adapter.js:/sse-adapter.js:ro" \
-  "$MCP_IMAGE" \
-  bun /sse-adapter.js "$MCP_PORT" -- bun run /app/dist/index.js >/dev/null
+  -p "127.0.0.1:$MCP_PORT:3000" \
+  -e VAULT_PATH=/vault \
+  -v "$OBSIDIAN_VAULT_PATH:/vault" \
+  "$MCP_IMAGE" >/dev/null
 ok "container $MCP_CONTAINER started"
 sleep 3
 
-if ! wait_http "http://127.0.0.1:$MCP_PORT/sse" 120 200; then
+if ! wait_http "http://127.0.0.1:$MCP_PORT/sse" 120 200 -H "Accept: text/event-stream"; then
   docker logs --tail 30 "$MCP_CONTAINER" 2>&1 | sed 's/^/    mcp | /'
   die "The MCP server did not come up on http://127.0.0.1:$MCP_PORT/sse (see logs above)."
 fi
@@ -197,7 +192,7 @@ export PUBLIC_URL
 # ===================================================== 4. OAuth gateway :3385
 step "4/7  Starting the OAuth gateway (:$GATEWAY_PORT)"
 # Reach the MCP over the private Docker network (8385 is published on 127.0.0.1 only).
-export OBSIDIAN_MCP_URL="http://$MCP_CONTAINER:$MCP_PORT/sse"
+export OBSIDIAN_MCP_URL="http://$MCP_CONTAINER:3000/sse"
 docker compose up -d --build --remove-orphans >"$RUN_DIR/compose.log" 2>&1 \
   || { tail -n 20 "$RUN_DIR/compose.log"; die "docker compose up failed (full log: $RUN_DIR/compose.log)."; }
 
@@ -247,7 +242,7 @@ echo $! >"$RUN_DIR/proxy.pid"
 
 printf '  waiting for the proxy to connect'
 for _ in $(seq 1 90); do
-  grep -q 'Connected to server' "$RUN_DIR/proxy.log" 2>/dev/null && break
+  grep -qE 'has [0-9]+ tools' "$RUN_DIR/proxy.log" 2>/dev/null && break
   grep -q 'Failed to initialize server' "$RUN_DIR/proxy.log" 2>/dev/null && break
   kill -0 "$(cat "$RUN_DIR/proxy.pid")" 2>/dev/null || break
   printf '.'; sleep 1
