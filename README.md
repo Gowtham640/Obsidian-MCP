@@ -5,6 +5,10 @@ proxy** that sits in front of an unauthenticated SSE MCP server (e.g. the Obsidi
 on the homelab at `http://127.0.0.1:8385`) so it can be safely connected to
 **Claude.ai as a custom connector**.
 
+**Live public URL (stable): `https://mcp.cravecircle.cc/sse`** — Cloudflare named
+tunnel route (`mcp.cravecircle.cc`) → Tailscale Funnel (`:8443`) → this gateway
+(`:3385`) → the raw MCP (`:8385`).
+
 Claude requires the full OAuth 2.1 profile: **Dynamic Client Registration (RFC 7591)**,
 **PKCE with S256 (RFC 7636)**, and **JWT bearer access tokens** on every MCP call.
 This gateway implements all of it with no mocks.
